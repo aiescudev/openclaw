@@ -32,12 +32,15 @@ import {
 } from "../infra/outbound/session-binding-service.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.js";
+import { startAcpSpawnParentStreamRelay } from "./acp-spawn-parent-stream.js";
 import { resolveSandboxRuntimeStatus } from "./sandbox/runtime-status.js";
 
 export const ACP_SPAWN_MODES = ["run", "session"] as const;
 export type SpawnAcpMode = (typeof ACP_SPAWN_MODES)[number];
 export const ACP_SPAWN_SANDBOX_MODES = ["inherit", "require"] as const;
 export type SpawnAcpSandboxMode = (typeof ACP_SPAWN_SANDBOX_MODES)[number];
+export const ACP_SPAWN_STREAM_TARGETS = ["parent"] as const;
+export type SpawnAcpStreamTarget = (typeof ACP_SPAWN_STREAM_TARGETS)[number];
 
 export type SpawnAcpParams = {
   task: string;
@@ -47,6 +50,7 @@ export type SpawnAcpParams = {
   mode?: SpawnAcpMode;
   thread?: boolean;
   sandbox?: SpawnAcpSandboxMode;
+  streamTo?: SpawnAcpStreamTarget;
 };
 
 export type SpawnAcpContext = {
@@ -234,6 +238,14 @@ export async function spawnAcpDirect(
     };
   }
   const sandboxMode = params.sandbox === "require" ? "require" : "inherit";
+  const streamToParentRequested = params.streamTo === "parent";
+  const parentSessionKey = ctx.agentSessionKey?.trim();
+  if (streamToParentRequested && !parentSessionKey) {
+    return {
+      status: "error",
+      error: 'sessions_spawn streamTo="parent" requires an active requester session context.',
+    };
+  }
   const requesterRuntime = resolveSandboxRuntimeStatus({
     cfg,
     sessionKey: ctx.agentSessionKey,
@@ -410,6 +422,7 @@ export async function spawnAcpDirect(
     ? `channel:${boundThreadId}`
     : requesterOrigin?.to?.trim() || (deliveryThreadId ? `channel:${deliveryThreadId}` : undefined);
   const hasDeliveryTarget = Boolean(requesterOrigin?.channel && inferredDeliveryTo);
+  const deliverToBoundTarget = hasDeliveryTarget && !streamToParentRequested;
   const childIdem = crypto.randomUUID();
   let childRunId: string = childIdem;
   try {
@@ -423,7 +436,7 @@ export async function spawnAcpDirect(
         accountId: hasDeliveryTarget ? (requesterOrigin?.accountId ?? undefined) : undefined,
         threadId: hasDeliveryTarget ? deliveryThreadId : undefined,
         idempotencyKey: childIdem,
-        deliver: hasDeliveryTarget,
+        deliver: deliverToBoundTarget,
         label: params.label || undefined,
       },
       timeoutMs: 10_000,
@@ -443,6 +456,15 @@ export async function spawnAcpDirect(
       error: summarizeError(err),
       childSessionKey: sessionKey,
     };
+  }
+
+  if (streamToParentRequested && parentSessionKey) {
+    startAcpSpawnParentStreamRelay({
+      runId: childRunId,
+      parentSessionKey,
+      childSessionKey: sessionKey,
+      agentId: targetAgentId,
+    });
   }
 
   return {
