@@ -10,6 +10,7 @@ import { scopedHeartbeatWakeOptions } from "../routing/session-key.js";
 const DEFAULT_STREAM_FLUSH_MS = 2_500;
 const DEFAULT_NO_OUTPUT_NOTICE_MS = 60_000;
 const DEFAULT_NO_OUTPUT_POLL_MS = 15_000;
+const DEFAULT_MAX_RELAY_LIFETIME_MS = 6 * 60 * 60 * 1000;
 const STREAM_BUFFER_MAX_CHARS = 4_000;
 const STREAM_SNIPPET_MAX_CHARS = 220;
 
@@ -81,6 +82,7 @@ export function startAcpSpawnParentStreamRelay(params: {
   streamFlushMs?: number;
   noOutputNoticeMs?: number;
   noOutputPollMs?: number;
+  maxRelayLifetimeMs?: number;
 }): () => void {
   const runId = params.runId.trim();
   const parentSessionKey = params.parentSessionKey.trim();
@@ -100,6 +102,10 @@ export function startAcpSpawnParentStreamRelay(params: {
     typeof params.noOutputPollMs === "number" && Number.isFinite(params.noOutputPollMs)
       ? Math.max(250, Math.floor(params.noOutputPollMs))
       : DEFAULT_NO_OUTPUT_POLL_MS;
+  const maxRelayLifetimeMs =
+    typeof params.maxRelayLifetimeMs === "number" && Number.isFinite(params.maxRelayLifetimeMs)
+      ? Math.max(1_000, Math.floor(params.maxRelayLifetimeMs))
+      : DEFAULT_MAX_RELAY_LIFETIME_MS;
 
   const relayLabel = truncate(compactWhitespace(params.agentId), 40) || "ACP child";
   const contextPrefix = `acp-spawn:${runId}`;
@@ -153,6 +159,7 @@ export function startAcpSpawnParentStreamRelay(params: {
   let lastProgressAt = Date.now();
   let stallNotified = false;
   let flushTimer: NodeJS.Timeout | undefined;
+  let relayLifetimeTimer: NodeJS.Timeout | undefined;
 
   const clearFlushTimer = () => {
     if (!flushTimer) {
@@ -160,6 +167,13 @@ export function startAcpSpawnParentStreamRelay(params: {
     }
     clearTimeout(flushTimer);
     flushTimer = undefined;
+  };
+  const clearRelayLifetimeTimer = () => {
+    if (!relayLifetimeTimer) {
+      return;
+    }
+    clearTimeout(relayLifetimeTimer);
+    relayLifetimeTimer = undefined;
   };
 
   const flushPending = () => {
@@ -185,7 +199,7 @@ export function startAcpSpawnParentStreamRelay(params: {
     flushTimer.unref?.();
   };
 
-  const stopNoOutputWatcher = setInterval(() => {
+  const noOutputWatcherTimer = setInterval(() => {
     if (disposed || noOutputNoticeMs <= 0) {
       return;
     }
@@ -201,7 +215,19 @@ export function startAcpSpawnParentStreamRelay(params: {
       `${contextPrefix}:stall`,
     );
   }, noOutputPollMs);
-  stopNoOutputWatcher.unref?.();
+  noOutputWatcherTimer.unref?.();
+
+  relayLifetimeTimer = setTimeout(() => {
+    if (disposed) {
+      return;
+    }
+    emit(
+      `${relayLabel} stream relay timed out after ${Math.max(1, Math.round(maxRelayLifetimeMs / 1000))}s without completion.`,
+      `${contextPrefix}:timeout`,
+    );
+    dispose();
+  }, maxRelayLifetimeMs);
+  relayLifetimeTimer.unref?.();
 
   emit(
     `Started ${relayLabel} session ${params.childSessionKey}. Streaming progress updates to parent session.`,
@@ -287,7 +313,8 @@ export function startAcpSpawnParentStreamRelay(params: {
     }
     disposed = true;
     clearFlushTimer();
-    clearInterval(stopNoOutputWatcher);
+    clearRelayLifetimeTimer();
+    clearInterval(noOutputWatcherTimer);
     unsubscribe();
   };
 
