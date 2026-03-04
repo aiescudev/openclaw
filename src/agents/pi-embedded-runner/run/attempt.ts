@@ -1428,7 +1428,39 @@ export async function runEmbeddedAttempt(
             sessionManager.resetLeaf();
           }
           const sessionContext = sessionManager.buildSessionContext();
-          activeSession.agent.replaceMessages(sessionContext.messages);
+          // Re-run the full sanitization pipeline on the rebuilt messages.
+          // buildSessionContext() returns raw messages from the session file which
+          // may contain orphaned tool_result blocks (from crashes, aborts, branch
+          // switches, etc.). Without re-sanitizing, these orphaned tool_results
+          // reach the API and trigger 400 errors:
+          //   "unexpected tool_use_id found in tool_result blocks"
+          const sanitizedOrphan = await sanitizeSessionHistory({
+            messages: sessionContext.messages,
+            modelApi: params.model.api,
+            modelId: params.modelId,
+            provider: params.provider,
+            allowedToolNames,
+            config: params.config,
+            sessionManager,
+            sessionId: params.sessionId,
+            policy: transcriptPolicy,
+          });
+          const orphanValidatedGemini = transcriptPolicy.validateGeminiTurns
+            ? validateGeminiTurns(sanitizedOrphan)
+            : sanitizedOrphan;
+          const orphanValidated = transcriptPolicy.validateAnthropicTurns
+            ? validateAnthropicTurns(orphanValidatedGemini)
+            : orphanValidatedGemini;
+          const orphanTruncated = limitHistoryTurns(
+            orphanValidated,
+            getDmHistoryLimitFromSessionKey(params.sessionKey, params.config),
+          );
+          const orphanLimited = transcriptPolicy.repairToolUseResultPairing
+            ? sanitizeToolUseResultPairing(orphanTruncated)
+            : orphanTruncated;
+          if (orphanLimited.length > 0) {
+            activeSession.agent.replaceMessages(orphanLimited);
+          }
           log.warn(
             `Removed orphaned user message to prevent consecutive user turns. ` +
               `runId=${params.runId} sessionId=${params.sessionId}`,
